@@ -1,0 +1,17 @@
+fixture: 07-update-all-fields.yaml
+
+expected:
+  status: ok
+  result: planned
+  operation: update
+  changes:
+    ipv4:
+      from: 198.51.100.1/32
+      to: 198.51.100.10/32
+    description:
+      from: Development-Link
+      to: Production-Link
+    admin_state:
+      from: down
+      to: up
+

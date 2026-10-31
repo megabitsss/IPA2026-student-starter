@@ -1,0 +1,12 @@
+desired:
+  name: Loopback555
+  ipv4: 172.16.50.1/32
+  description: Standby-Loopback
+  admin_state: down
+
+current:
+  name: Loopback555
+  ipv4: 172.16.50.1/32
+  description: Standby-Loopback
+  admin_state: up
+

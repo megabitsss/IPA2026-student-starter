@@ -1,0 +1,12 @@
+desired:
+  name: Loopback777
+  ipv4: 198.51.100.10/32
+  description: Production-Link
+  admin_state: up
+
+current:
+  name: Loopback777
+  ipv4: 198.51.100.1/32
+  description: Development-Link
+  admin_state: down
+
