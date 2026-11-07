@@ -1,12 +1,37 @@
 """Netmiko + TextFSM backend for Part 3.
 
 The test suite injects callables ``netmiko_get`` and ``netmiko_delete`` that
-simulate real Netmiko interactions.  This module normalises their output
-or translates raised exceptions into the canonical result format expected by
-the dispatcher.
+simulate real Netmiko interactions. When omitted, real Netmiko SSH transport
+is used.
 """
 
+import os
 from typing import Any, Dict
+
+try:
+    from netmiko import ConnectHandler
+    from netmiko.exceptions import (
+        NetmikoAuthenticationException,
+        NetmikoTimeoutException,
+    )
+    NETMIKO_AVAILABLE = True
+except ImportError:
+    NETMIKO_AVAILABLE = False
+
+
+def _handle_netmiko_error(e):
+    if isinstance(e, PermissionError):
+        return {"status": "error", "result": "authentication_failed"}
+    if isinstance(e, ConnectionError):
+        return {"status": "error", "result": "connection_failed"}
+    if NETMIKO_AVAILABLE:
+        if isinstance(e, NetmikoAuthenticationException):
+            return {"status": "error", "result": "authentication_failed"}
+        if isinstance(e, NetmikoTimeoutException):
+            return {"status": "error", "result": "connection_failed"}
+    if isinstance(e, RuntimeError):
+        return {"status": "error", "result": "backend_failed"}
+    return {"status": "error", "result": "backend_failed"}
 
 
 def _map_admin_state(link_status: str, protocol_status: str) -> str:
@@ -27,7 +52,6 @@ def _port_matches(port_name: str, interface_name: str) -> bool:
     (e.g. Loopback123). Also handles exact matches."""
     if port_name == interface_name:
         return True
-    # Common abbreviation mappings
     abbrevs = {
         "Lo": "Loopback",
         "Gi": "GigabitEthernet",
@@ -37,7 +61,6 @@ def _port_matches(port_name: str, interface_name: str) -> bool:
     }
     for short, full in abbrevs.items():
         if interface_name.startswith(full) and port_name.startswith(short):
-            # Compare the numeric suffix
             if interface_name[len(full):] == port_name[len(short):]:
                 return True
     return False
@@ -49,21 +72,45 @@ def get_interface_state(
     netmiko_get: Any = None,
 ) -> Dict[str, Any]:
     """Return normalized interface state using Netmiko + TextFSM."""
+    if netmiko_get is None:
+        if not NETMIKO_AVAILABLE:
+            raise RuntimeError("netmiko library is required")
+
+        def _default_get(target_router, target_iface):
+            device = {
+                "device_type": "cisco_ios",
+                "host": target_router,
+                "username": os.environ.get("ROUTER_USER", ""),
+                "password": os.environ.get("ROUTER_PASS", ""),
+            }
+            with ConnectHandler(**device) as net_connect:
+                ip_info = net_connect.send_command(
+                    f"show ip interface {target_iface}",
+                    use_textfsm=True,
+                )
+                descriptions = net_connect.send_command(
+                    "show interfaces description",
+                    use_textfsm=True,
+                )
+                if isinstance(ip_info, str):
+                    ip_info = []
+                if isinstance(descriptions, str):
+                    descriptions = []
+                return (ip_info, descriptions)
+
+        netmiko_get = _default_get
+
     try:
-        if netmiko_get is None:
-            raise RuntimeError("netmiko_get callable not provided")
         ip_info, descriptions = netmiko_get(router, interface_name)
-        # Find the matching entry for the requested interface.
         iface_entry = next(
             (i for i in ip_info if i.get("interface") == interface_name), None
         )
         if not iface_entry:
             return {"status": "ok", "result": "not_found", "interface": None}
-        # Build IPv4/Prefix string — values may be lists (TextFSM output).
+
         ip_addr = _extract_scalar(iface_entry.get("ip_address"))
         prefix = _extract_scalar(iface_entry.get("prefix_length"))
         ipv4 = f"{ip_addr}/{prefix}" if ip_addr and prefix is not None else None
-        # Find description — port name may be abbreviated (e.g. Lo123).
         desc_entry = next(
             (d for d in descriptions if _port_matches(d.get("port", ""), interface_name)),
             {},
@@ -80,12 +127,8 @@ def get_interface_state(
             "admin_state": admin_state,
         }
         return {"status": "ok", "result": "found", "interface": normalized}
-    except PermissionError:
-        return {"status": "error", "result": "authentication_failed"}
-    except ConnectionError:
-        return {"status": "error", "result": "connection_failed"}
-    except Exception:
-        return {"status": "error", "result": "backend_failed"}
+    except Exception as e:
+        return _handle_netmiko_error(e)
 
 
 def delete_interface(
@@ -93,24 +136,41 @@ def delete_interface(
     interface_name: str,
     netmiko_delete: Any = None,
 ) -> Dict[str, Any]:
-    """Delete an interface using Netmiko.
+    """Delete an interface using Netmiko."""
+    if netmiko_delete is None:
+        if not NETMIKO_AVAILABLE:
+            raise RuntimeError("netmiko library is required")
 
-    ``netmiko_delete`` returns the ``delete_result`` value directly as a
-    string (``"deleted"`` or ``"not_found"``), NOT wrapped in a dict.
-    """
+        def _default_delete(target_router, target_iface):
+            device = {
+                "device_type": "cisco_ios",
+                "host": target_router,
+                "username": os.environ.get("ROUTER_USER", ""),
+                "password": os.environ.get("ROUTER_PASS", ""),
+            }
+            with ConnectHandler(**device) as net_connect:
+                output = net_connect.send_command(
+                    f"show ip interface brief {target_iface}"
+                )
+                # Check if interface exists in output table
+                has_iface = any(
+                    line.strip().startswith(target_iface)
+                    for line in output.splitlines()
+                )
+                if not has_iface:
+                    return "not_found"
+
+                net_connect.send_config_set([f"no interface {target_iface}"])
+                return "deleted"
+
+        netmiko_delete = _default_delete
+
     try:
-        if netmiko_delete is None:
-            raise RuntimeError("netmiko_delete callable not provided")
         delete_res = netmiko_delete(router, interface_name)
-        # delete_res is a plain string like "deleted" or "not_found"
         if delete_res == "deleted":
             return {"status": "ok", "result": "deleted"}
         if delete_res == "not_found":
             return {"status": "ok", "result": "not_found", "interface": None}
         return {"status": "error", "result": "backend_failed"}
-    except PermissionError:
-        return {"status": "error", "result": "authentication_failed"}
-    except ConnectionError:
-        return {"status": "error", "result": "connection_failed"}
-    except Exception:
-        return {"status": "error", "result": "backend_failed"}
+    except Exception as e:
+        return _handle_netmiko_error(e)
